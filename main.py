@@ -306,7 +306,19 @@ def short_public_key(public_key: str) -> str:
     return f"{public_key[:4]}...{public_key[-4:]}"
 
 
-WALLET_STORE = WalletStore()
+# Persistent wallet storage: use Supabase when configured, otherwise keep the
+# in-memory fallback for local development.
+_SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+_SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "").strip()
+if _SUPABASE_URL and _SUPABASE_SERVICE_KEY:
+    from supabase_store import SupabaseClient, SupabaseWalletStore
+    WALLET_STORE = SupabaseWalletStore(
+        SupabaseClient(_SUPABASE_URL, _SUPABASE_SERVICE_KEY)
+    )
+    logger.info("⚡ Supabase wallet storage enabled.")
+else:
+    WALLET_STORE = WalletStore()
+    logger.info("ℹ️ Supabase wallet storage disabled; using in-memory wallet storage.")
 
 
 WALLET_PAGE_TEMPLATE = """<!doctype html>
@@ -447,7 +459,7 @@ async def wallet_verify_page(request: web.Request) -> web.Response:
 
 async def wallet_message(request: web.Request) -> web.Response:
     session_token = request.query.get("session", "")
-    result = WALLET_STORE.get_message(session_token)
+    result = await WALLET_STORE.get_message(session_token)
     if result is None:
         return web.json_response(
             {"ok": False, "error": "This verification link is invalid or expired."},
@@ -489,7 +501,7 @@ async def wallet_verify(request: web.Request) -> web.Response:
             status=400,
         )
 
-    session = WALLET_STORE.get_session(session_token)
+    session = await WALLET_STORE.get_session(session_token)
     if session is not None:
         logger.info(
             "Wallet connected for Discord user=%s, wallet=%s.",
@@ -497,7 +509,7 @@ async def wallet_verify(request: web.Request) -> web.Response:
             short_public_key(public_key),
         )
 
-    verified, message, association = WALLET_STORE.verify(
+    verified, message, association = await WALLET_STORE.verify(
         session_token,
         public_key,
         signature,
@@ -1301,7 +1313,7 @@ async def on_tree_interaction_check(interaction: discord.Interaction) -> bool:
 @bot.tree.command(name="wallet", description="Verify ownership of your Solana wallet via cryptographic signature.")
 async def wallet(interaction: discord.Interaction) -> None:
     """Send a secure one-time verification link with button."""
-    session = WALLET_STORE.create_session(interaction.user.id)
+    session = await WALLET_STORE.create_session(interaction.user.id)
     url = bot.wallet_url(session.token)
     logger.info(
         "Created verification session %s for user=%s; URL=%s",
@@ -1335,7 +1347,7 @@ async def wallet(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="wallet-status", description="Check if your Solana wallet is verified.")
 async def wallet_status(interaction: discord.Interaction) -> None:
     """Display verification status for the calling user."""
-    association = WALLET_STORE.get_association(interaction.user.id)
+    association = await WALLET_STORE.get_association(interaction.user.id)
     if association is None:
         await interaction.response.send_message(
             "❌ **Wallet verified:** Non\n"
@@ -1356,7 +1368,7 @@ async def wallet_status(interaction: discord.Interaction) -> None:
 @bot.tree.command(name="wallet-remove", description="Unlink your verified Solana wallet from your Discord account.")
 async def wallet_remove(interaction: discord.Interaction) -> None:
     """Remove wallet association for the calling user."""
-    association = WALLET_STORE.remove_association(interaction.user.id)
+    association = await WALLET_STORE.remove_association(interaction.user.id)
     if association is None:
         await interaction.response.send_message(
             "You do not have any verified wallet associated with your Discord account.",

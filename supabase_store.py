@@ -265,11 +265,11 @@ class SupabaseWalletStore:
         self.client = client
 
     async def create_session(self, discord_user_id: int, ttl_seconds: int = 600) -> Any:
-        from main import WalletSession, generate_nonce
+        from main import WalletSession
         import secrets
 
         token = secrets.token_urlsafe(32)
-        nonce = generate_nonce()
+        nonce = secrets.token_urlsafe(24)
         now = datetime.now(timezone.utc)
         from datetime import timedelta
         expires_at = now + timedelta(seconds=ttl_seconds)
@@ -308,12 +308,110 @@ class SupabaseWalletStore:
             used=r.get("used", False),
         )
 
+    async def get_message(self, token: str) -> Optional[tuple[str, datetime]]:
+        """Return the signed verification message and expiry for a valid session."""
+        from main import WALLET_MAX_SIGNATURE_ATTEMPTS
+
+        session = await self.get_session(token)
+        if (
+            session is None
+            or session.used
+            or session.expires_at <= datetime.now(timezone.utc)
+            or session.attempts >= WALLET_MAX_SIGNATURE_ATTEMPTS
+        ):
+            return None
+        message = (
+            "NFT Market Wallet Verification\\n"
+            f"Discord User ID: {session.discord_user_id}\\n"
+            f"Nonce: {session.nonce}"
+        )
+        return message, session.expires_at
+
     async def mark_session_used(self, token: str) -> None:
         await self.client.patch(
             "wallet_sessions",
             {"used": True},
             params={"token": f"eq.{token}"},
         )
+
+    async def verify(
+        self, token: str, public_key: str, encoded_signature: str
+    ) -> tuple[bool, str, Optional[Any]]:
+        """Verify an Ed25519 signature and persist the wallet association."""
+        import base64
+        import binascii
+        from nacl.exceptions import BadSignatureError
+        from nacl.signing import VerifyKey
+        from main import (
+            WALLET_MAX_SIGNATURE_ATTEMPTS,
+            decode_base58,
+            short_public_key,
+            WalletAssociation,
+        )
+
+        session = await self.get_session(token)
+        if session is None or session.used:
+            return False, "This verification link is invalid or already used.", None
+        now = datetime.now(timezone.utc)
+        if session.expires_at <= now:
+            await self.mark_session_used(token)
+            return False, "This verification link has expired. Run /wallet again.", None
+        if session.attempts >= WALLET_MAX_SIGNATURE_ATTEMPTS:
+            await self.mark_session_used(token)
+            return False, "Too many signature attempts. Run /wallet again.", None
+
+        # Increment attempts in the database before verification.
+        await self.client.patch(
+            "wallet_sessions",
+            {"attempts": session.attempts + 1},
+            params={"token": f"eq.{token}"},
+        )
+
+        try:
+            public_key_bytes = decode_base58(public_key)
+            try:
+                signature_bytes = base64.b64decode(encoded_signature, validate=True)
+                if len(signature_bytes) != 64:
+                    signature_bytes = decode_base58(encoded_signature)
+            except (binascii.Error, ValueError):
+                signature_bytes = decode_base58(encoded_signature)
+
+            if len(public_key_bytes) != 32 or len(signature_bytes) != 64:
+                raise ValueError("Unexpected Solana key or signature length.")
+
+            message = (
+                "NFT Market Wallet Verification\\n"
+                f"Discord User ID: {session.discord_user_id}\\n"
+                f"Nonce: {session.nonce}"
+            )
+            VerifyKey(public_key_bytes).verify(message.encode("utf-8"), signature_bytes)
+        except (BadSignatureError, ValueError, binascii.Error, TypeError):
+            if session.attempts + 1 >= WALLET_MAX_SIGNATURE_ATTEMPTS:
+                await self.mark_session_used(token)
+            return False, "The wallet signature is invalid.", None
+
+        existing = await self.get_wallet(session.discord_user_id)
+        if existing is not None and existing.public_key != public_key:
+            await self.mark_session_used(token)
+            return False, "A different wallet is already associated. Use /wallet-remove first.", None
+
+        # Prevent one wallet from being linked to another Discord account.
+        wallet_users = await self.client.get(
+            "wallet_associations",
+            params={"public_key": f"eq.{public_key}"},
+        )
+        if wallet_users and wallet_users[0].get("discord_user_id") != session.discord_user_id:
+            await self.mark_session_used(token)
+            return False, "This wallet is already associated with another Discord account.", None
+
+        association = await self.associate_wallet(session.discord_user_id, public_key)
+        await self.mark_session_used(token)
+        logger.info(
+            "Wallet associated with Discord user=%s, wallet=%s.",
+            session.discord_user_id,
+            short_public_key(public_key),
+        )
+        return True, "Wallet verified successfully.", association
 
     async def associate_wallet(self, discord_user_id: int, public_key: str) -> Any:
         from main import WalletAssociation
@@ -345,6 +443,16 @@ class SupabaseWalletStore:
     async def remove_wallet(self, discord_user_id: int) -> bool:
         res = await self.client.delete("wallet_associations", params={"discord_user_id": f"eq.{discord_user_id}"})
         return len(res) > 0
+
+    async def get_association(self, discord_user_id: int) -> Optional[Any]:
+        return await self.get_wallet(discord_user_id)
+
+    async def remove_association(self, discord_user_id: int) -> Optional[Any]:
+        existing = await self.get_wallet(discord_user_id)
+        if existing is None:
+            return None
+        await self.remove_wallet(discord_user_id)
+        return existing
 
 
 def get_stores():
